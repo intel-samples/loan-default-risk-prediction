@@ -1,0 +1,6 @@
+numpy
+polars
+pyarrow
+xgboost
+scikit-learn
+scikit-learn-intelex

@@ -1,9 +1,0 @@
-name: intel
-channels:
-  - intel
-dependencies:
-  - python=3.7
-  - intel-aikit-modin=2021.4.1
-  - pip
-  - pip:
-    - matplotlib==3.5.3

@@ -1,0 +1,11 @@
+name: loan_default
+channels:
+  - conda-forge
+dependencies:
+  - python
+  - numpy
+  - polars
+  - pyarrow
+  - xgboost
+  - scikit-learn
+  - scikit-learn-intelex

@@ -1,13 +1,12 @@
 # !/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# Copyright (C) 2022 Intel Corporation
+# Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: BSD-3-Clause
 
 # pylint: disable=C0415,E0401,R0914
 
 """
-Run incremental training with bias measurements
+Fits an XGBoost model to credit bureau data, transforming
+features as necessary in a scikit-learn pipeline
 """
 
 import argparse
@@ -15,20 +14,22 @@ import pathlib
 import logging
 import time
 import warnings
+import pickle
+import os
 
-import joblib
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
+import polars as pl
 import xgboost as xgb
 
 from utils.fairness import get_fairness_parity_report
-from utils.preprocess import get_feature_names
 
-plt.set_loglevel("info")
-warnings.filterwarnings("ignore")
-warnings.simplefilter(action='ignore', category=FutureWarning)
-np.random.seed(5)
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import PowerTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import classification_report, roc_auc_score
 
 
 def main(flags):
@@ -46,252 +47,113 @@ def main(flags):
         logging.basicConfig(filename=flags.logfile, level=logging.DEBUG)
     logger = logging.getLogger()
 
-    from sklearn.compose import ColumnTransformer
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import PowerTransformer, OneHotEncoder
-    from sklearn.impute import SimpleImputer
-    from sklearn.metrics import classification_report, roc_auc_score
-
     # load data
-    data_train = pd.read_csv(flags.train_file)
-
-    if flags.size > 0: # for benchmarking purposes
-        orig = flags.size // len(data_train)
-        data_train = data_train.loc[np.repeat(
-            data_train.index.values, orig + 1)]
-        data_train = data_train.iloc[:flags.size]
-
-        if orig > 1:
-
-            # perturbing all int/float columns
-            person_age = data_train['person_age'].values + \
-                np.random.randint(-1, 1, size=len(data_train))
-            person_income = data_train['person_income'].values + \
-                np.random.normal(0, 10, size=len(data_train))
-            person_emp_length = data_train['person_emp_length'].values + \
-                np.random.randint(-1, 1, size=len(data_train))
-            loan_amnt = data_train['loan_amnt'].values + \
-                np.random.normal(0, 5, size=len(data_train))
-            loan_int_rate = data_train['loan_int_rate'].values + \
-                np.random.normal(0, 0.2, size=len(data_train))
-            loan_percent_income = data_train['loan_percent_income'].values + \
-                (np.random.randint(0, 100, size=len(data_train)) / 1000)
-            cb_person_cred_hist_length = data_train['cb_person_cred_hist_length'].values + \
-                np.random.randint(0, 2, size=len(data_train))
-
-            # perturbing all binary columns
-            perturb_idx = np.random.rand(len(data_train)) > 0.1
-            random_values = np.random.choice(
-                data_train['person_home_ownership'].unique(), len(data_train))
-            person_home_ownership = np.where(
-                perturb_idx, data_train['person_home_ownership'], random_values)
-
-            perturb_idx = np.random.rand(len(data_train)) > 0.1
-            random_values = np.random.choice(
-                data_train['loan_intent'].unique(), len(data_train))
-            loan_intent = np.where(
-                perturb_idx, data_train['loan_intent'], random_values)
-
-            perturb_idx = np.random.rand(len(data_train)) > 0.1
-            random_values = np.random.choice(
-                data_train['loan_grade'].unique(), len(data_train))
-            loan_grade = np.where(
-                perturb_idx, data_train['loan_grade'], random_values)
-
-            perturb_idx = np.random.rand(len(data_train)) > 0.1
-            random_values = np.random.choice(
-                data_train['cb_person_default_on_file'].unique(), len(data_train))
-            cb_person_default_on_file = np.where(
-                perturb_idx, data_train['cb_person_default_on_file'], random_values)
-
-            data_train = pd.DataFrame(list(zip(
-                person_age, person_income, person_home_ownership,
-                person_emp_length, loan_intent, loan_grade,
-                loan_amnt, loan_int_rate, data_train['loan_status'].values,
-                loan_percent_income, cb_person_default_on_file, 
-                cb_person_cred_hist_length, data_train['bias_variable'].values
-            )), columns = data_train.columns)
-
-        data_train = data_train.drop_duplicates()
-        assert(len(data_train) == flags.size)
-        data_train.reset_index()
+    data_train = pl.read_parquet(flags.train_file)
 
     # Don't train on bias variable
-    X_train = data_train.drop(['loan_status', 'bias_variable'], axis=1)
-    y_train = data_train['loan_status']
+    X_train = data_train.drop(["loan_status", "bias_variable"])
+    y_train = data_train["loan_status"]
 
-    # define model
-    params = {
-        'objective': 'binary:logistic',
-        'eval_metric': 'logloss',
-        'nthread': flags.num_cpu,
-        'tree_method': 'hist',
-        'learning_rate': 0.02,
-        'max_depth': 10,
-        'min_child_weight': 6,
-        'n_jobs': flags.num_cpu,
-        'verbosity': 0,
-        'silent': 1
-    }
-    if flags.trained_model is None:
-        num_imputer = Pipeline(
-            steps=[
-                ('imputer', SimpleImputer(strategy='median'))
-            ]
-        )
-        pow_transformer = PowerTransformer()
-        cat_transformer = OneHotEncoder(handle_unknown="ignore")
+    # define model using scikit-learn idioms
+    classifier_model = Pipeline(
+        steps=[
+            (
+                "col_transformer",
+                ColumnTransformer(
+                    transformers=[
+                        (
+                            "num",
+                            SimpleImputer(strategy="median"),
+                            ["loan_int_rate", "person_emp_length", "cb_person_cred_hist_length"],
+                        ),
+                        (
+                            "cat",
+                            OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=5),
+                            ["person_home_ownership", "loan_intent", "loan_grade", "cb_person_default_on_file"]
+                        ),
+                    ],
+                    remainder="passthrough",
+                )
+            ),
+            (
+                "xgb",
+                xgb.XGBClassifier(
+                    n_estimators=100,
+                    learning_rate=0.01,
+                    max_depth=10,
+                    min_child_weight=6,
+                    verbosity=0,
+                ),
+            ),
+        ]
+    ).set_output(transform="polars")
 
-        preprocessor = ColumnTransformer(transformers=[
-            ('num', num_imputer, ['loan_int_rate', 'person_emp_length',
-                                  'cb_person_cred_hist_length']),
-            ('pow', pow_transformer, ['person_age', 'person_income',
-                                      'loan_amnt', 'loan_percent_income']),
-            ('cat', cat_transformer, ['person_home_ownership',
-                                      'loan_intent', 'loan_grade',
-                                      'cb_person_default_on_file'])
-        ], remainder='passthrough')
-
-        # separate pipeline to allow for benchmarking
-        preprocess = Pipeline(steps=[
-            ('preprocessor', preprocessor)
-        ])
-    else:
-        models = joblib.load(flags.trained_model)
-        preprocess = models['preprocess']
-        clf = models['clf']
-
-    # Train model
-    # Refit everything including the pre-processor
-    X_train_out = preprocess.fit_transform(X_train)
-    fnames = get_feature_names(preprocess.named_steps['preprocessor'])
-    dtrain = xgb.DMatrix(
-        X_train_out, y_train.values,
-        feature_names=fnames
-    )
     start = time.time()
-    if flags.trained_model is not None:
-        clf = xgb.train(params, dtrain, xgb_model=clf,
-                        num_boost_round=flags.estimators)
-        end = time.time()
-        logger.info(
-            "Incremental update training time : %f seconds", end-start)
-    else:
-        clf = xgb.train(params, dtrain, num_boost_round=flags.estimators)
-        end = time.time()
-        logger.info("New model training time : %f seconds", end-start)
+    clf = classifier_model.fit(X_train, y_train)
+    end = time.time()
+    logger.info("Model fitting time : %f seconds", end-start)
 
     # Evaluate model performance metrics on hold out test set
-    data_test = pd.read_csv(flags.test_file)
-    bias_indicator = data_test['bias_variable'].values.astype(int)
-    X_test = data_test.drop(['loan_status', 'bias_variable'], axis=1)
-    y_test = data_test['loan_status']
+    data_test = pl.read_parquet(flags.test_file)
+    X_test = data_test.drop(["loan_status", "bias_variable"])
+    y_test = data_test["loan_status"]
 
-    X_test_out = preprocess.transform(X_test)
-    X_test_out = pd.DataFrame(
-        X_test_out, columns=fnames)
-
-    predictions = clf.predict(xgb.DMatrix(X_test_out))
+    predicted_class = classifier_model.predict(X_test)
+    predicted_probabilities = classifier_model.predict_proba(X_test)
     logger.info(classification_report(
-        predictions > 0.5, y_test
+        predicted_class, y_test
     ))
-    auc = roc_auc_score(y_test, predictions)
-    logger.info("AUC : %f", auc)
+    auc = roc_auc_score(y_test, predicted_probabilities[:, 1])
+    logger.info("AUROC : %f", auc)
 
     # record fairness metrics for given model on holdout test set
     parity_values = get_fairness_parity_report(
-        clf, X_test_out, y_test,
-        bias_indicator)
+        classifier_model,
+        X_test, y_test,
+        data_test["bias_variable"],
+    )
 
     print("Parity Ratios (Privileged/Non-Privileged):")
     for k, v in parity_values.items():
         print(f"\t{k.upper()} : {v:.2f}")
 
-    # save model and preprocessor
+    # save model and preprocessor as a unified pipeline
     if flags.save_model_path is not None:
         path = pathlib.Path(flags.save_model_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({'preprocess': preprocess, 'clf': clf}, path)
-
-        if flags.intel:
-            # if intel is toggled, also convert to daal4py optimized model
-            import daal4py as d4p
-            daal_model = d4p.get_gbt_model_from_xgboost(clf)
-            fname = path.stem + "_daal" + path.suffix
-            outfile = path.parent / fname
-            joblib.dump({'preprocess': preprocess, 'clf': daal_model}, outfile)
+        with open(path / "classifier_model.pkl", "wb") as out_file:
+            pickle.dump(classifier_model, out_file)
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-
     parser.add_argument(
-        '--intel',
-        action="store_true",
-        required=False,
-        default=False,
-        help='use intel daal4py for model optimization'
-    )
-
-    parser.add_argument(
-        '--num_cpu',
-        type=int,
-        required=False,
-        default=4,
-        help='number of cpu cores to use'
-    )
-
-    parser.add_argument(
-        '--size',
-        type=int,
-        required=False,
-        default=-1,
-        help='number of data entries to duplicate data for training and benchmarking. \
-             -1 uses the original data size. Default is -1.'
-    )
-
-    parser.add_argument(
-        '--trained_model',
+        "--save_model_path",
         type=str,
         required=False,
-        default=None,
-        help="saved trained model to incrementally update.  If not provided, trains a new model."
+        default="saved_models",
+        help="Path to save the fitted model.  If not provided, does not save."
     )
-
     parser.add_argument(
-        '--save_model_path',
+        "--train_file",
         type=str,
         required=False,
-        default=None,
-        help="path to save a trained model.  If not provided, does not save."
+        default=os.path.join("data", "credit_risk_train.parquet"),
+        help="Data file for training (parquet format)."
     )
-
     parser.add_argument(
-        '--train_file',
+        "--test_file",
         type=str,
-        required=True,
-        help="data file for training"
+        required=False,
+        default=os.path.join("data", "credit_risk_test.parquet"),
+        help="Data file for testing (parquet format)."
     )
-
     parser.add_argument(
-        '--test_file',
-        type=str,
-        required=True,
-        help="data file for testing"
-    )
-
-    parser.add_argument(
-        '--logfile',
+        "--logfile",
         type=str,
         default="",
-        help="log file to output benchmarking results to")
-
-    parser.add_argument(
-        '--estimators',
-        type=int,
-        default=100,
-        help=" number of estimators to use.")
+        help="Log file to output benchmarking results to.")
 
     FLAGS = parser.parse_args()
     main(FLAGS)
